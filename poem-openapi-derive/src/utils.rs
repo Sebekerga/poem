@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Deref};
 
 use darling::{util::SpannedValue, FromMeta};
 use proc_macro2::{Ident, Span, TokenStream};
@@ -6,7 +6,7 @@ use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
 use syn::{
     visit_mut, visit_mut::VisitMut, Attribute, Error, Expr, ExprLit, GenericParam, Generics,
-    Lifetime, Lit, Meta, Result,
+    Lifetime, Lit, Meta, Path, Result,
 };
 
 use crate::error::GeneratorResult;
@@ -112,7 +112,7 @@ pub(crate) fn parse_oai_attrs<T: FromMeta>(attrs: &[Attribute]) -> GeneratorResu
 pub(crate) fn convert_oai_path<'a, 'b: 'a>(
     path: &'a SpannedValue<String>,
     prefix_path: &'b Option<SpannedValue<String>>,
-) -> Result<(String, String)> {
+) -> Result<(String, TokenStream, TokenStream)> {
     if !path.starts_with('/') {
         return Err(Error::new(path.span(), "The path must start with '/'."));
     }
@@ -134,7 +134,80 @@ pub(crate) fn convert_oai_path<'a, 'b: 'a>(
         new_path += "/";
     }
 
-    Ok((oai_path, new_path))
+    Ok((
+        oai_path.clone(),
+        quote! { #new_path },
+        quote! { String::from(#oai_path) },
+    ))
+}
+
+pub(crate) fn convert_oai_path_runtime<'a, 'b: 'a>(
+    path: &'a SpannedValue<String>,
+    prefix_path: &'b SpannedValue<Path>,
+) -> Result<(String, TokenStream, TokenStream)> {
+    let mut oai_path = String::new();
+    let mut new_path = String::new();
+
+    let prefix_path_inner = prefix_path.deref();
+    let path_inner = path.deref();
+    let path_as_tkn = quote! {
+       {
+            fn handle_path(
+                path: &mut String,
+                oai_path: &mut String,
+                new_path: &mut String,
+            ) -> Result<(), ()> {
+                let mut vars = std::collections::HashSet::new();
+
+                for s in path.split('/') {
+                    if s.is_empty() {
+                        continue;
+                    }
+
+                    if let Some(var) = s.strip_prefix(':') {
+                        oai_path.push_str("/{");
+                        oai_path.push_str(var);
+                        oai_path.push('}');
+
+                        new_path.push_str("/:");
+                        new_path.push_str(var);
+
+                        if !vars.insert(var) {
+                            return Err(());
+                        }
+                    } else {
+                        oai_path.push('/');
+                        oai_path.push_str(s);
+
+                        new_path.push('/');
+                        new_path.push_str(s);
+                    }
+                }
+                Ok(())
+            }
+
+            let mut prefix_path = String::from(#prefix_path_inner);
+            let mut path = String::from(#path_inner);
+            let mut oai_path = String::new();
+            let mut new_path = String::new();
+
+
+            handle_path(&mut prefix_path, &mut oai_path, &mut new_path).unwrap();
+            handle_path(&mut path, &mut oai_path, &mut new_path).unwrap();
+
+            if oai_path.is_empty() {
+                oai_path += "/";
+            }
+
+            if new_path.is_empty() {
+                new_path += "/";
+            }
+
+            oai_path
+       }
+    };
+
+    Ok((oai_path, quote! { #new_path }, path_as_tkn))
 }
 
 #[allow(clippy::needless_lifetimes)]

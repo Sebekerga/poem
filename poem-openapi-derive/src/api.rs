@@ -1,19 +1,21 @@
+use std::ops::Deref;
+
 use darling::{util::SpannedValue, FromMeta};
 use indexmap::IndexMap;
 use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::{
-    ext::IdentExt, visit_mut::VisitMut, Error, FnArg, ImplItem, ImplItemFn, ItemImpl, Pat, Path,
-    ReturnType, Type,
+    ext::IdentExt, visit_mut::VisitMut, Error, Expr, FnArg, ImplItem, ImplItemFn, ItemImpl, Meta,
+    Pat, Path, ReturnType, Type,
 };
 
 use crate::{
     common_args::{APIMethod, CodeSample, DefaultValue, ExternalDocument, ExtraHeader},
     error::GeneratorResult,
     utils::{
-        convert_oai_path, get_crate_name, get_description, get_summary_and_description,
-        optional_literal, optional_literal_string, parse_oai_attrs, remove_description,
-        remove_oai_attrs, RemoveLifetime,
+        convert_oai_path, convert_oai_path_runtime, get_crate_name, get_description,
+        get_summary_and_description, optional_literal, optional_literal_string, parse_oai_attrs,
+        remove_description, remove_oai_attrs, RemoveLifetime,
     },
     validators::Validators,
 };
@@ -23,7 +25,7 @@ pub(crate) struct APIArgs {
     #[darling(default)]
     internal: bool,
     #[darling(default)]
-    prefix_path: Option<SpannedValue<String>>,
+    prefix_path: Option<SpannedValue<Meta>>,
     #[darling(default, multiple, rename = "tag")]
     common_tags: Vec<Path>,
     #[darling(default, multiple, rename = "response_header")]
@@ -80,7 +82,7 @@ struct APIOperationParam {
 
 struct Context {
     add_routes: Vec<TokenStream>,
-    operations: IndexMap<String, Vec<TokenStream>>,
+    operations: IndexMap<String, (Option<TokenStream>, Vec<TokenStream>)>,
     register_items: Vec<TokenStream>,
 }
 
@@ -118,11 +120,24 @@ pub(crate) fn generate(args: APIArgs, mut item_impl: ItemImpl) -> GeneratorResul
     let paths = {
         let mut paths = Vec::new();
 
-        for (path, operation) in operations {
-            paths.push(quote! {
-                #crate_name::registry::MetaPath {
-                    path: #path,
-                    operations: ::std::vec![#(#operation),*],
+        for (path, operation_and_path) in operations {
+            let operations = operation_and_path.1;
+            paths.push(match operation_and_path.0 {
+                Some(path_as_tkn) => {
+                    quote! {
+                        #crate_name::registry::MetaPath {
+                            path: #path_as_tkn,
+                            operations: ::std::vec![#(#operations),*],
+                        }
+                    }
+                }
+                None => {
+                    quote! {
+                        #crate_name::registry::MetaPath {
+                            path: #path,
+                            operations: ::std::vec![#(#operations),*],
+                        }
+                    }
                 }
             });
         }
@@ -187,7 +202,50 @@ fn generate_operation(
     let description = optional_literal(&description);
     let tags = api_args.common_tags.iter().chain(&tags);
 
-    let (oai_path, new_path) = convert_oai_path(&path, &api_args.prefix_path)?;
+    let (oai_path, new_path, new_path_as_tkn) = match &api_args.prefix_path {
+        Some(prefix_path) => {
+            let value = prefix_path.deref();
+            match value {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    Expr::Lit(expr_lit) => {
+                        let lit = expr_lit.lit.clone();
+                        let str_lit = match lit {
+                            syn::Lit::Str(lit_str) => lit_str.value(),
+                            _ => {
+                                return Err(Error::new_spanned(
+                                    fn_ident,
+                                    "Invalid prefix path definition",
+                                )
+                                .into());
+                            }
+                        };
+                        let spanned = SpannedValue::new(str_lit, prefix_path.span());
+                        convert_oai_path(&path, &Some(spanned))?
+                    }
+                    Expr::Path(expr_path) => convert_oai_path_runtime(
+                        &path,
+                        &SpannedValue::new(expr_path.path.clone(), prefix_path.span()),
+                    )?,
+                    _ => {
+                        return Err(
+                            Error::new_spanned(fn_ident, "Invalid prefix path definition").into(),
+                        );
+                    }
+                },
+                _ => {
+                    return Err(
+                        Error::new_spanned(fn_ident, "Invalid prefix path definition").into(),
+                    );
+                }
+            }
+        }
+        None => convert_oai_path(&path, &None)?,
+    };
+
+    // panic!(
+    //     "oai_path: {}, new_path: {}, new_path_as_tkn: {}",
+    //     oai_path, new_path, new_path_as_tkn
+    // );
 
     if item_method.sig.inputs.is_empty() {
         return Err(Error::new_spanned(
@@ -416,7 +474,7 @@ fn generate_operation(
         });
 
         ctx.add_routes.push(quote! {
-            route_table.entry(::std::string::ToString::to_string(#new_path))
+            route_table.entry(#new_path_as_tkn)
                 .or_default()
                 .insert(#crate_name::__private::poem::http::Method::#http_method, {
                     let api_obj = ::std::clone::Clone::clone(&api_obj);
@@ -541,6 +599,7 @@ fn generate_operation(
             ctx.operations
                 .entry(oai_path.clone())
                 .or_default()
+                .1
                 .push(quote! {
                     #crate_name::registry::MetaOperation {
                         tags: ::std::vec![#(#tag_names),*],
@@ -574,6 +633,7 @@ fn generate_operation(
                         code_samples: ::std::vec![#(#code_samples),*],
                     }
                 });
+            ctx.operations.entry(oai_path.clone()).or_default().0 = Some(new_path_as_tkn.clone());
         }
     }
 
