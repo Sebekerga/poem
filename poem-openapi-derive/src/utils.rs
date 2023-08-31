@@ -145,15 +145,15 @@ pub(crate) fn convert_oai_path_runtime<'a, 'b: 'a>(
     path: &'a SpannedValue<String>,
     prefix_path: &'b SpannedValue<Path>,
 ) -> Result<(String, TokenStream, TokenStream)> {
-    let mut oai_path = String::new();
-    let mut new_path = String::new();
+    let oai_path = String::new();
+    let new_path = String::new();
 
     let prefix_path_inner = prefix_path.deref();
     let path_inner = path.deref();
     let path_as_tkn = quote! {
        {
             fn handle_path(
-                path: &mut String,
+                path: &str,
                 oai_path: &mut String,
                 new_path: &mut String,
             ) -> Result<(), ()> {
@@ -192,8 +192,8 @@ pub(crate) fn convert_oai_path_runtime<'a, 'b: 'a>(
             let mut new_path = String::new();
 
 
-            handle_path(&mut prefix_path, &mut oai_path, &mut new_path).unwrap();
-            handle_path(&mut path, &mut oai_path, &mut new_path).unwrap();
+            handle_path(&prefix_path, &mut oai_path, &mut new_path).unwrap();
+            handle_path(&path, &mut oai_path, &mut new_path).unwrap();
 
             if oai_path.is_empty() {
                 oai_path += "/";
